@@ -1,0 +1,48 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>ReplicaSet 交接演练台 · Flask + SQLite</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+<header class="topbar" id="top">
+  <div class="wrap topbar-inner">
+    <div>
+      <h1>ReplicaSet 换组交接演练台</h1>
+      <p class="subtitle">
+        选一个正在接 Service 流量的<strong>就绪 Pod</strong> 交给新控制器：
+        UID / 就绪状态保留 · 仍命中原 Service · 只命中新 ReplicaSet · 两边期望数联动
+      </p>
+    </div>
+    <form method="post" action="{{ url_for('web_reset') }}"
+          onsubmit="return confirm('确定重置？将恢复为初始 2 RS / 5 Pod / 1 Service 样例。');">
+      <button class="btn btn-ghost" type="submit">↺ 重置样例</button>
+    </form>
+  </div>
+</header>
+
+<main class="wrap">
+  {% with messages = get_flashed_messages(with_categories=true) %}
+    {% if messages %}
+      <div class="flashes">
+        {% for category, message in messages %}
+          <div class="flash flash-{{ category }}">
+            <span class="flash-icon">{{ '✓' if category == 'ok' else '!' }}</span>
+            <span>{{ message }}</span>
+          </div>
+        {% endfor %}
+      </div>
+    {% endif %}
+  {% endwith %}
+
+  {% block content %}{% endblock %}
+</main>
+
+<footer class="wrap footer">
+  <span>本地演练页 · Flask + SQLite · 所有选择器均为等值标签（key=value，AND）</span>
+  <span>JSON API：<code>GET /api/state</code> · <code>POST /api/handover</code> · <code>POST /api/plans</code></span>
+</footer>
+</body>
+</html>

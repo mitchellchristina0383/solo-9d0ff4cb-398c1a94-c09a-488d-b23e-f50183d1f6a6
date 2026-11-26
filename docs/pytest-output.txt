@@ -1,0 +1,10 @@
+============================= test session starts ==============================
+platform linux -- Python 3.11.2, pytest-9.2.0, pluggy-1.7.0
+rootdir: /workspace
+configfile: pytest.ini
+testpaths: tests
+collected 12 items
+
+tests/test_drill.py ............                                         [100%]
+
+============================== 12 passed in 3.13s ==============================

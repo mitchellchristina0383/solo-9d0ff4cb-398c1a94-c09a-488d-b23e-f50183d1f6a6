@@ -1,0 +1,313 @@
+{% extends "base.html" %}
+{% macro label_chips(labels) -%}
+<span class="chips">
+  {%- for k, v in labels.items() -%}
+  <span class="chip">{{ k }}=<b>{{ v }}</b></span>
+  {%- endfor -%}
+</span>
+{%- endmacro %}
+
+{% block content %}
+
+<!-- ============ 1. Service 就绪名单 ============ -->
+<section class="panel">
+  <div class="panel-head">
+    <h2>① Service 与就绪名单（endpoints）</h2>
+    <span class="hint">只有标签命中选择器且 Ready 的 Pod 才在名单中</span>
+  </div>
+  <div class="svc-grid">
+    {% for svc in s.services %}
+    <article class="card svc-card">
+      <header class="card-head">
+        <h3>{{ svc.name }}</h3>
+        <span class="badge badge-svc">Service</span>
+      </header>
+      <p class="selector-line">选择器（等值）：{{ label_chips(svc.selector) }}</p>
+      <p class="note">{{ svc.note }}</p>
+
+      <div class="endpoint-head">
+        就绪名单
+        <span class="count-pill count-ready">{{ svc.endpoints|length }}</span>
+      </div>
+      {% if svc.endpoints %}
+      <ul class="endpoint-list">
+        {% for p in svc.endpoints %}
+        <li>
+          <span class="dot dot-ready" title="Ready"></span>
+          <span class="pod-name">{{ p.name }}</span>
+          <code class="uid" title="{{ p.uid }}">{{ p.short_uid }}</code>
+          <span class="owner-tag">归属 {{ p.owner_name }}</span>
+          {{ label_chips(p.labels) }}
+        </li>
+        {% endfor %}
+      </ul>
+      {% else %}
+      <p class="empty">暂无就绪 endpoints。</p>
+      {% endif %}
+
+      {% if svc.not_ready_matching %}
+      <p class="endpoint-head endpoint-head-warn">命中选择器但未就绪（不接流量）：
+        <span class="count-pill count-warn">{{ svc.not_ready_matching|length }}</span>
+      </p>
+      <ul class="endpoint-list muted-list">
+        {% for p in svc.not_ready_matching %}
+        <li>
+          <span class="dot dot-notready"></span>
+          <span class="pod-name">{{ p.name }}</span>
+          <code class="uid" title="{{ p.uid }}">{{ p.short_uid }}</code>
+          <span class="owner-tag">归属 {{ p.owner_name }}</span>
+        </li>
+        {% endfor %}
+      </ul>
+      {% endif %}
+    </article>
+    {% endfor %}
+  </div>
+</section>
+
+<!-- ============ 2. Pod 交接 ============ -->
+<section class="panel" id="handover-panel">
+  <div class="panel-head">
+    <h2>② 选择一个就绪 Pod 交接给新 ReplicaSet</h2>
+    <span class="hint">同一事务内：改标签/归属 · 旧组 desired−1 · 新组 desired+1；办不到则全部保留</span>
+  </div>
+
+  <form method="post" action="{{ url_for('web_handover') }}">
+    <div class="table-wrap">
+      <table class="grid-table">
+        <thead>
+          <tr>
+            <th class="col-pick">选</th>
+            <th>Pod</th>
+            <th>UID（交接不变）</th>
+            <th>就绪</th>
+            <th>标签</th>
+            <th>现有归属</th>
+            <th>选择器当前命中</th>
+            <th>{{ s.services[0].name if s.services else 'Service' }} 流量</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for p in s.pods %}
+          <tr class="{{ 'row-disabled' if not p.ready else '' }}">
+            <td class="col-pick">
+              <input type="radio" name="pod_uid" value="{{ p.uid }}"
+                     {% if not p.ready %}disabled title="未就绪，不能交接"{% endif %}
+                     required aria-label="选择 {{ p.name }}">
+            </td>
+            <td class="pod-name">{{ p.name }}</td>
+            <td><code class="uid" title="{{ p.uid }}">{{ p.uid }}</code></td>
+            <td>
+              {% if p.ready %}<span class="badge badge-ready">Ready</span>
+              {% else %}<span class="badge badge-notready">NotReady</span>{% endif %}
+            </td>
+            <td>{{ label_chips(p.labels) }}</td>
+            <td><span class="owner-tag owner-strong">{{ p.owner_name }}</span></td>
+            <td>
+              {% for n in p.matched_rs_names %}
+                <span class="badge {{ 'badge-ok' if p.matched_rs_names|length == 1 else 'badge-warn' }}">{{ n }}</span>
+              {% else %}<span class="muted">无</span>{% endfor %}
+            </td>
+            <td>
+              {% if s.services and s.services[0].id in p.matched_service_ids and p.ready %}
+                <span class="badge badge-svc">在就绪名单</span>
+              {% elif s.services and s.services[0].id in p.matched_service_ids %}
+                <span class="badge badge-warn">命中但未就绪</span>
+              {% else %}
+                <span class="muted">不在</span>
+              {% endif %}
+            </td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+
+    <div class="handover-bar">
+      <label class="target-label">
+        交接目标
+        <select name="target_rs_id" required>
+          {% for rs in s.replicasets %}
+          <option value="{{ rs.id }}">
+            {{ rs.name }}（{{ rs.selector_text }}）{{ '· 演练冲突组' if rs.drill else '' }}
+          </option>
+          {% endfor %}
+        </select>
+      </label>
+      <button class="btn btn-primary" type="submit"
+              onclick="return confirm('确认交接选中的就绪 Pod？将联动修改标签、归属和两边期望副本数；失败会保留原状。');">
+        🚚 执行交接（事务，失败自动保留原状）
+      </button>
+      <span class="hint">提示：可先到 ④ 构造标签冲突目标，再在此处试跑“办不到”的交接。</span>
+    </div>
+  </form>
+</section>
+
+<!-- ============ 3. ReplicaSet 归属与计划 ============ -->
+<section class="panel" id="plans">
+  <div class="panel-head">
+    <h2>③ ReplicaSet：现有归属、期望数与副本增删计划</h2>
+    <span class="hint">计划只记录“期望数 + 归属 UID 集合”依据，可稍后执行；交接使依据变化后，旧计划执行时会被退回</span>
+  </div>
+
+  <div class="rs-grid">
+    {% for rs in s.replicasets %}
+    <article class="card rs-card {{ 'rs-drill' if rs.drill else '' }}" id="rs-{{ rs.id }}">
+      <header class="card-head">
+        <h3>{{ rs.name }}</h3>
+        {% if rs.id == 'rs-v1' %}<span class="badge badge-old">旧组</span>{% endif %}
+        {% if rs.id == 'rs-v2' %}<span class="badge badge-new">新组</span>{% endif %}
+        {% if rs.drill %}<span class="badge badge-danger">冲突演练</span>{% endif %}
+      </header>
+      <p class="selector-line">选择器：{{ label_chips(rs.selector) }}</p>
+      <p class="note">{{ rs.note }}</p>
+
+      <div class="stat-row">
+        <div class="stat"><span class="stat-num">{{ rs.desired }}</span><span class="stat-label">期望 desired</span></div>
+        <div class="stat"><span class="stat-num">{{ rs.owned_count }}</span><span class="stat-label">现有归属</span></div>
+        <div class="stat"><span class="stat-num stat-ready">{{ rs.ready_count }}</span><span class="stat-label">其中就绪</span></div>
+      </div>
+
+      <form method="post" action="{{ url_for('web_set_desired', rs_id=rs.id) }}" class="scale-form">
+        <label>调整期望数
+          <input type="number" name="desired" min="0" max="50" value="{{ rs.desired }}" required>
+        </label>
+        <button class="btn btn-small" type="submit">更新</button>
+      </form>
+
+      <p class="owned-head">归属的 Pod（{{ rs.owned_count }}）</p>
+      <ul class="owned-list">
+        {% for p in s.pods if p.rs_id == rs.id %}
+        <li>
+          <span class="dot {{ 'dot-ready' if p.ready else 'dot-notready' }}"></span>
+          <span class="pod-name">{{ p.name }}</span>
+          <code class="uid" title="{{ p.uid }}">{{ p.short_uid }}</code>
+          {{ label_chips(p.labels) }}
+          {% if p.matched_rs_ids != [rs.id] %}
+          <span class="badge badge-warn">选择器命中：{{ p.matched_rs_names|join('、') or '无' }}</span>
+          {% endif %}
+        </li>
+        {% else %}
+        <li class="empty">（暂无归属 Pod）</li>
+        {% endfor %}
+      </ul>
+
+      <form method="post" action="{{ url_for('web_generate_plan') }}" class="gen-plan-form">
+        <input type="hidden" name="rs_id" value="{{ rs.id }}">
+        <button class="btn btn-small btn-primary" type="submit">📝 按期望 {{ rs.desired }} 与当前归属生成增删计划</button>
+      </form>
+
+      <div class="plan-list">
+        {% for plan in rs.plans %}
+        <article class="plan plan-{{ plan.status }} {{ 'plan-stale' if plan.stale else '' }}" id="plan-{{ plan.id }}">
+          <header class="plan-head">
+            <strong>计划 #{{ plan.id }}</strong>
+            <span class="badge badge-status-{{ plan.status }}">{{ plan.status|status_cn }}</span>
+            <span class="time">{{ plan.created_at }} UTC</span>
+          </header>
+          <p class="plan-summary">{{ plan.summary }}</p>
+          <p class="plan-basis">
+            生成依据：desired={{ plan.basis_desired }}，归属 UID {{ plan.basis_uids|length }} 个
+            （{% for u in plan.basis_uids %}<code class="uid">{{ u[:13] }}…</code>{% if not loop.last %} {% endif %}{% endfor %}）
+          </p>
+
+          {% if plan.stale %}
+          <p class="stale-box">
+            ⚠ 该计划已过期：{% for c in plan.stale_changes %}{{ c }}；{% endfor %}
+            <strong>情况已变化，请重新生成计划。</strong>
+          </p>
+          {% endif %}
+
+          {% if plan.status == 'pending' %}
+          <div class="plan-actions">
+            <form method="post" action="{{ url_for('web_execute_plan', plan_id=plan.id) }}">
+              <button class="btn btn-small {{ 'btn-warn' if plan.stale else 'btn-primary' }}" type="submit">
+                {{ '执行旧计划（应被退回）' if plan.stale else '▶ 稍后执行计划' }}
+              </button>
+            </form>
+            <form method="post" action="{{ url_for('web_discard_plan', plan_id=plan.id) }}">
+              <button class="btn btn-small btn-ghost" type="submit">丢弃</button>
+            </form>
+          </div>
+          {% elif plan.status == 'returned' %}
+          <p class="returned-box">↩ {{ plan.stale_reason }}</p>
+          <form method="post" action="{{ url_for('web_generate_plan') }}" class="replan-form">
+            <input type="hidden" name="rs_id" value="{{ rs.id }}">
+            <button class="btn btn-small btn-primary" type="submit">↻ 重新生成计划</button>
+          </form>
+          {% elif plan.status == 'executed' %}
+          <p class="executed-box">✓ {{ plan.result }} <span class="time">{{ plan.executed_at }} UTC</span></p>
+          {% endif %}
+        </article>
+        {% else %}
+        <p class="muted tiny">还没有计划。</p>
+        {% endfor %}
+      </div>
+
+      {% if rs.drill and rs.owned_count == 0 %}
+      <form method="post" action="{{ url_for('web_remove_drill', rs_id=rs.id) }}" class="remove-drill">
+        <button class="btn btn-small btn-danger-ghost" type="submit">移除该演练组</button>
+      </form>
+      {% endif %}
+    </article>
+    {% endfor %}
+  </div>
+</section>
+
+<!-- ============ 4. 标签冲突演练 ============ -->
+<section class="panel">
+  <div class="panel-head">
+    <h2>④ “办不到”演练：构造标签冲突</h2>
+    <span class="hint">构造后到 ② 选择就绪 Pod 并把目标选为冲突组，观察拒绝原因与状态不变</span>
+  </div>
+  <div class="drill-actions">
+    <form method="post" action="{{ url_for('web_conflict', kind='app_key') }}">
+      <button class="btn btn-warn" type="submit">构造键值冲突：新增选择器 app=canary 的 RS</button>
+      <span class="hint">Service 要求 app=shop，同一标签键两个值，无解</span>
+    </form>
+    <form method="post" action="{{ url_for('web_conflict', kind='overlap') }}">
+      <button class="btn btn-warn" type="submit">构造选择器重叠：新增与 web-v1 完全相同选择器的 RS</button>
+      <span class="hint">交接后无法做到“只命中新 ReplicaSet”</span>
+    </form>
+  </div>
+</section>
+
+<!-- ============ 5. 交接记录 + 审计 ============ -->
+<section class="panel grid-two">
+  <div>
+    <div class="panel-head"><h2>⑤ 交接记录</h2></div>
+    {% if s.handovers %}
+    <ul class="timeline">
+      {% for h in s.handovers %}
+      <li>
+        <div class="timeline-head">
+          <strong>{{ h.pod_name }}</strong>
+          <span class="badge badge-old">{{ h.from_rs_name }}</span> →
+          <span class="badge badge-new">{{ h.to_rs_name }}</span>
+          <span class="time">{{ h.created_at }} UTC</span>
+        </div>
+        <p class="tiny">UID <code>{{ h.pod_uid }}</code> 保持不变；ready 状态保持不变</p>
+        <p class="tiny">{{ label_chips(h.old_labels) }} ⇒ {{ label_chips(h.new_labels) }}</p>
+        <p class="tiny">{{ h.desired_change }}</p>
+      </li>
+      {% endfor %}
+    </ul>
+    {% else %}
+    <p class="empty">还没有成功交接记录。</p>
+    {% endif %}
+  </div>
+  <div>
+    <div class="panel-head"><h2>操作审计</h2></div>
+    <ul class="audit-list">
+      {% for a in s.audit %}
+      <li class="{{ 'audit-bad' if not a.ok else '' }}">
+        <span class="time">{{ a.created_at }} UTC</span>
+        <span class="badge {{ 'badge-notready' if not a.ok else 'badge-ready' }}">{{ a.kind }}</span>
+        <span>{{ a.message }}</span>
+      </li>
+      {% endfor %}
+    </ul>
+  </div>
+</section>
+
+{% endblock %}

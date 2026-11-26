@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+drill.db
+drill.db-wal
+drill.db-shm
+.venv/

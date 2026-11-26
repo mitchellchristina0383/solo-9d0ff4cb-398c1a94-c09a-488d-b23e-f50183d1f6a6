@@ -1,0 +1,26 @@
+services:
+  web:
+    build: .
+    image: rs-handover-drill:latest
+    container_name: rs-handover-drill
+    ports:
+      - "5000:5000"
+    environment:
+      # 指向命名卷，重置/重启容器后演练数据仍在；想完全干净可用 docker compose down -v
+      DRILL_DB: /data/drill.db
+    volumes:
+      - drill-data:/data
+    restart: unless-stopped
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request,sys; r=urllib.request.urlopen('http://127.0.0.1:5000/api/health', timeout=3); sys.exit(0 if r.status==200 else 1)"
+      interval: 5s
+      timeout: 4s
+      retries: 12
+      start_period: 5s
+
+volumes:
+  drill-data:
