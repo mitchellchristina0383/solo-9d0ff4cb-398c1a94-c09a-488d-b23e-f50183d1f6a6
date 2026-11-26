@@ -39,6 +39,12 @@ python3 wsgi.py                 # 或：gunicorn --bind 127.0.0.1:5000 wsgi:appl
    - 重算标签，保证**仍命中原 `shop-svc`**，且在所有 RS 中**只命中目标 RS**；
    - `web-v1.desired − 1`、目标 RS `desired + 1`；
    - 任何标签冲突 / 未就绪 / 期望数触底等“办不到”情况：**全部不写入**，页面红字说明原因。
+   - **并发安全**：交接与计划执行都用 `BEGIN IMMEDIATE` 写锁串行化，拿锁后重新读取并核对状态。
+     同一 Pod 同时交给同一目标组**只有一笔生效**（另一笔 `409 same_replicaset`，期望数不再变动、不写成功记录）；
+     两个不同 Pod 并发交接时按实际生效顺序逐笔核对，仍符合条件的都完成；
+     缩容抢先删掉 Pod 时交接报 `pod_not_found`（并发场景 HTTP 409），两组期望数保持原值且无成功记录；
+     交接抢先提交时，旧缩容计划在事务内复核失配并置为 `returned`，不删任何 Pod。
+   - 每条交接记录逐笔保存两组期望数的**实际前/后值**（`source_desired_before/after`、`target_desired_before/after`，页面 ⑤ 与 `/api/state` 均可见）。
 3. **副本增删计划**：按某 RS 的当前 `desired` 与归属 UID 集合生成 `+N` / `-N`（缩容优先删未就绪 Pod），计划保存为 `pending`，可稍后执行。
    - 计划保存依据 `basis_desired` + `basis_uids`（排序后的归属 UID 快照）。
    - 页面实时比对依据，过期计划显示“⚠ 情况已变化，请重新生成计划”。
@@ -63,6 +69,12 @@ python3 wsgi.py                 # 或：gunicorn --bind 127.0.0.1:5000 wsgi:appl
 python3 scripts/smoke_api.py http://127.0.0.1:5000
 ```
 
+并发交接专项实测（重复交接、不同 Pod 并发、交接/缩容两种生效顺序、页面表单模拟两个标签页同时提交；仅用标准库）：
+
+```bash
+python3 scripts/concurrent_check.py http://127.0.0.1:5000
+```
+
 ## JSON API
 
 | 方法与路径 | 说明 |
@@ -77,6 +89,9 @@ python3 scripts/smoke_api.py http://127.0.0.1:5000
 | `POST /api/reset` | 恢复初始样例 |
 
 业务错误统一为：`HTTP 409/400/404` + `{"ok": false, "error": {"code": "...", "message": "中文原因"}}`。
+并发落败时沿用既有错误码：重复交接 `same_replicaset`（`error.concurrent=true`）、
+Pod 已被缩容删除 `pod_not_found`（写事务内复核失败时 HTTP 409，`error.reason="deleted_by_scale_down"`）、
+旧计划失配 `stale_plan`。
 
 ## 跑测试
 
@@ -84,6 +99,10 @@ python3 scripts/smoke_api.py http://127.0.0.1:5000
 python3 -m pip install -r requirements-dev.txt
 python3 -m pytest -v
 ```
+
+当前共 **24** 个用例：原 `tests/test_drill.py` 的 12 个业务用例，加 `tests/test_concurrency.py` 的 12 个并发专项
+（同 Pod 重复交接唯一生效、Flask/HTTP 链路重复交接、不同 Pod 并发两笔均完成、缩容先删/交接先交两种确定性交错、
+6 轮无预设竞速不变量、逐笔前后值与页面渲染）。
 
 ## 目录结构
 
@@ -96,7 +115,9 @@ app/
   templates/       # base.html / index.html（服务端渲染，无构建步骤）
   static/style.css
 scripts/smoke_api.py   # 对真实 HTTP 服务的端到端冒烟（标准库）
-tests/test_drill.py    # 12 个用例
+scripts/concurrent_check.py  # 并发交接专项实测（含双标签页表单并发，标准库）
+tests/test_drill.py    # 12 个业务用例
+tests/test_concurrency.py  # 12 个并发交接/竞速用例
 Dockerfile / docker-compose.yml
-docs/                  # 交付说明与实测原始输出
+docs/                  # 交付说明、并发修复报告与实测原始输出
 ```

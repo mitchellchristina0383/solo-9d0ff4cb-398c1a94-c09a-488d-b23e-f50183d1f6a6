@@ -1,10 +1,34 @@
 ============================= test session starts ==============================
-platform linux -- Python 3.11.2, pytest-9.2.0, pluggy-1.7.0
+platform linux -- Python 3.11.2, pytest-9.2.0, pluggy-1.7.0 -- /usr/bin/python3
+cachedir: .pytest_cache
 rootdir: /workspace
 configfile: pytest.ini
 testpaths: tests
-collected 12 items
+collecting ... collected 24 items
 
-tests/test_drill.py ............                                         [100%]
+tests/test_concurrency.py::test_same_pod_concurrent_handover_single_effect PASSED [  4%]
+tests/test_concurrency.py::test_same_pod_concurrent_handover_over_http PASSED [  8%]
+tests/test_concurrency.py::test_two_different_pods_concurrent_handovers_both_commit PASSED [ 12%]
+tests/test_concurrency.py::test_scale_delete_commits_first_then_inflight_handover_fails_without_side_effects PASSED [ 16%]
+tests/test_concurrency.py::test_handover_commits_first_then_scale_plan_is_returned_and_keeps_all_pods PASSED [ 20%]
+tests/test_concurrency.py::test_parallel_handover_and_scale_race_invariants[0] PASSED [ 25%]
+tests/test_concurrency.py::test_parallel_handover_and_scale_race_invariants[1] PASSED [ 29%]
+tests/test_concurrency.py::test_parallel_handover_and_scale_race_invariants[2] PASSED [ 33%]
+tests/test_concurrency.py::test_parallel_handover_and_scale_race_invariants[3] PASSED [ 37%]
+tests/test_concurrency.py::test_parallel_handover_and_scale_race_invariants[4] PASSED [ 41%]
+tests/test_concurrency.py::test_parallel_handover_and_scale_race_invariants[5] PASSED [ 45%]
+tests/test_concurrency.py::test_state_and_page_render_actual_before_after PASSED [ 50%]
+tests/test_drill.py::test_seed_has_two_rs_five_pods_one_service_and_ready_endpoints PASSED [ 54%]
+tests/test_drill.py::test_home_page_renders PASSED                       [ 58%]
+tests/test_drill.py::test_ready_handover_keeps_uid_and_ready_preserves_service_and_moves_selector_only PASSED [ 62%]
+tests/test_drill.py::test_non_ready_pod_handover_refused_and_state_unchanged PASSED [ 66%]
+tests/test_drill.py::test_same_replicaset_handover_refused PASSED        [ 70%]
+tests/test_drill.py::test_label_value_conflict_with_service_blocks_and_preserves_state PASSED [ 75%]
+tests/test_drill.py::test_selector_overlap_conflict_blocks_and_preserves_state PASSED [ 79%]
+tests/test_drill.py::test_stale_add_plan_is_returned_after_handover_then_replan_executes PASSED [ 83%]
+tests/test_drill.py::test_handover_makes_target_group_plan_stale_too PASSED [ 87%]
+tests/test_drill.py::test_stale_delete_plan_is_returned_after_handover PASSED [ 91%]
+tests/test_drill.py::test_form_flow_execute_old_plan_shows_return_and_recalc_prompt PASSED [ 95%]
+tests/test_drill.py::test_reset_restores_seed PASSED                     [100%]
 
-============================== 12 passed in 3.13s ==============================
+============================== 24 passed in 1.76s ==============================

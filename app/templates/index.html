@@ -275,7 +275,10 @@
 <!-- ============ 5. 交接记录 + 审计 ============ -->
 <section class="panel grid-two">
   <div>
-    <div class="panel-head"><h2>⑤ 交接记录</h2></div>
+    <div class="panel-head">
+      <h2>⑤ 交接记录</h2>
+      <span class="hint">同一 Pod 并发交给同一目标组只有一笔生效；每笔记录的期望数前后值均为提交时的实际值</span>
+    </div>
     {% if s.handovers %}
     <ul class="timeline">
       {% for h in s.handovers %}
@@ -288,6 +291,14 @@
         </div>
         <p class="tiny">UID <code>{{ h.pod_uid }}</code> 保持不变；ready 状态保持不变</p>
         <p class="tiny">{{ label_chips(h.old_labels) }} ⇒ {{ label_chips(h.new_labels) }}</p>
+        {% if h.desired_pairs %}
+        <p class="tiny desired-ba">
+          <span class="ba-title">两组期望数实际前后值（本笔提交时读取）：</span>
+          {% for pair in h.desired_pairs %}
+          <span class="ba-chip">{{ pair.rs_name }}：<strong>{{ pair.before }}</strong> → <strong>{{ pair.after }}</strong></span>{% if not loop.last %}；{% endif %}
+          {% endfor %}
+        </p>
+        {% endif %}
         <p class="tiny">{{ h.desired_change }}</p>
       </li>
       {% endfor %}

@@ -252,3 +252,13 @@ input[type=number] { width: 76px; }
   display: flex; justify-content: space-between; gap: 12px; flex-wrap: wrap;
   color: var(--muted); font-size: 12.5px; padding-bottom: 28px;
 }
+
+/* 并发交接：逐笔期望数实际前后值 */
+.desired-ba { color: #374151; }
+.ba-title { color: var(--muted); }
+.ba-chip {
+  display: inline-block; padding: 1px 8px; margin: 2px 0;
+  border: 1px solid var(--line); border-radius: 999px;
+  background: #f3f4f6; font-size: 12px;
+}
+.ba-chip strong { color: #111827; }

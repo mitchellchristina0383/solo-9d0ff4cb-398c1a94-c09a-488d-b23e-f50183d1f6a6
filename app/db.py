@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 SCHEMA = """
 PRAGMA foreign_keys = ON;
@@ -46,6 +47,11 @@ CREATE TABLE IF NOT EXISTS handovers (
     old_labels_json  TEXT NOT NULL DEFAULT '{}',
     new_labels_json  TEXT NOT NULL DEFAULT '{}',
     desired_change   TEXT NOT NULL DEFAULT '',
+    -- 逐笔记录两组期望数在本笔事务提交时的“实际前后值”（并发下不得用请求开始时的快照值）
+    source_desired_before INTEGER,
+    source_desired_after  INTEGER,
+    target_desired_before INTEGER,
+    target_desired_after  INTEGER,
     created_at       TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
@@ -92,14 +98,65 @@ CONFLICT_OVERLAP_RS = "rs-conflict-overlap"
 def connect(db_path: str | Path) -> sqlite3.Connection:
     path = Path(db_path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    db = sqlite3.connect(str(path))
+    # timeout 与 busy_timeout 双保险：并发写时在锁上等待，而不是立刻 database is locked。
+    db = sqlite3.connect(str(path), timeout=30.0)
     db.row_factory = sqlite3.Row
     db.execute("PRAGMA foreign_keys = ON")
+    db.execute("PRAGMA busy_timeout = 30000")
     return db
+
+
+@contextmanager
+def immediate_transaction(db: sqlite3.Connection) -> Iterator[sqlite3.Connection]:
+    """并发写用的串行化事务。
+
+    ``BEGIN IMMEDIATE`` 在事务一开始就取 SQLite 写锁：所有“交接 / 计划执行”
+    因此按 BEGIN 成功的顺序逐笔生效，后到者拿到锁后必须重新读取最新状态再核对条件，
+    从而避免基于旧快照做判断和写入。
+
+    保持 sqlite3 默认的延迟事务控制（isolation_level=""）。若调用方连接上已经有
+    未提交事务（``in_transaction`` 为真，例如测试在同一连接上先做了未提交 DML），
+    则不重复下发 BEGIN，也不替调用方 COMMIT/ROLLBACK，只加入其既有事务。
+    """
+    started_here = not db.in_transaction
+    if started_here:
+        db.execute("BEGIN IMMEDIATE")
+    try:
+        yield db
+    except BaseException:
+        if started_here:
+            db.rollback()
+        raise
+    else:
+        if started_here:
+            db.commit()
+
+
+# 老版本数据库（含旧命名卷里的 drill.db）平滑补列。
+_COLUMN_MIGRATIONS: dict[str, dict[str, str]] = {
+    "handovers": {
+        "source_desired_before": "INTEGER",
+        "source_desired_after": "INTEGER",
+        "target_desired_before": "INTEGER",
+        "target_desired_after": "INTEGER",
+    },
+}
+
+
+def _migrate_schema(db: sqlite3.Connection) -> None:
+    for table, columns in _COLUMN_MIGRATIONS.items():
+        existing = {row["name"] for row in db.execute(f"PRAGMA table_info({table})").fetchall()}
+        if not existing:
+            continue  # 表尚不存在：SCHEMA 建表时已含新列
+        for name, decl in columns.items():
+            if name not in existing:
+                db.execute(f"ALTER TABLE {table} ADD COLUMN {name} {decl}")
+    db.commit()
 
 
 def init_schema(db: sqlite3.Connection) -> None:
     db.executescript(SCHEMA)
+    _migrate_schema(db)
     db.commit()
 
 

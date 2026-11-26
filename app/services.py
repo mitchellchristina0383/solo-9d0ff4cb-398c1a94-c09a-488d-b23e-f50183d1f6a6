@@ -8,11 +8,12 @@ from __future__ import annotations
 import json
 import sqlite3
 import uuid
-from typing import Any
+from typing import Any, Callable
 
 from .db import (
     CONFLICT_APP_RS,
     CONFLICT_OVERLAP_RS,
+    immediate_transaction,
 )
 from .domain import (
     HandoverImpossible,
@@ -32,6 +33,24 @@ class UseCaseError(Exception):
         self.message = message
         self.status = status
         self.extra = extra or {}
+
+
+# ---------------------------------------------------------------------------
+# 并发实测卡点（生产运行时为 None，行为完全不变）
+#
+# 测试 / 实测脚本可注入 ``_CONCURRENCY_HOOK``，在关键时序点阻塞，以确定性地
+# 复现“读到旧状态后、提交前”的交错：
+#   - "handover:before_begin"：交接已做完事务前读取，尚未 BEGIN IMMEDIATE
+#   - "plan:after_precheck"  ：计划已按旧快照通过过期预检，尚未进入写事务复核
+# ---------------------------------------------------------------------------
+
+_CONCURRENCY_HOOK: Callable[[str], None] | None = None
+
+
+def _hook(point: str) -> None:
+    hook = _CONCURRENCY_HOOK
+    if hook is not None:
+        hook(point)
 
 
 # ---------------------------------------------------------------------------
@@ -151,6 +170,44 @@ def build_snapshot(db: sqlite3.Connection) -> dict[str, Any]:
         item = dict(row)
         item["old_labels"] = json.loads(item.pop("old_labels_json"))
         item["new_labels"] = json.loads(item.pop("new_labels_json"))
+        sb = item.get("source_desired_before")
+        sa = item.get("source_desired_after")
+        tb = item.get("target_desired_before")
+        ta = item.get("target_desired_after")
+        if sb is not None and sa is not None and tb is not None and ta is not None:
+            # 逐笔两组期望数的“实际前→后”，模板与 API 共用。
+            item["desired_pairs"] = [
+                {
+                    "rs_id": item.get("from_rs_id"),
+                    "rs_name": item.get("from_rs_name"),
+                    "before": sb,
+                    "after": sa,
+                },
+                {
+                    "rs_id": item.get("to_rs_id"),
+                    "rs_name": item.get("to_rs_name"),
+                    "before": tb,
+                    "after": ta,
+                },
+            ]
+            item["desired_before_after"] = {
+                item.get("from_rs_id"): {"name": item.get("from_rs_name"), "before": sb, "after": sa},
+                item.get("to_rs_id"): {"name": item.get("to_rs_name"), "before": tb, "after": ta},
+            }
+            # 常见命名别名，方便脚本/测试按不同习惯取值。
+            item["desired_before"] = {item.get("from_rs_id"): sb, item.get("to_rs_id"): tb}
+            item["desired_after"] = {item.get("from_rs_id"): sa, item.get("to_rs_id"): ta}
+            item["old_source_desired"] = sb
+            item["new_source_desired"] = sa
+            item["old_target_desired"] = tb
+            item["new_target_desired"] = ta
+            # 与旧实现局部变量命名对齐的别名
+            item["old_desired_source"] = sb
+            item["new_desired_source"] = sa
+            item["old_desired_target"] = tb
+            item["new_desired_target"] = ta
+        else:
+            item["desired_pairs"] = []
         handovers.append(item)
 
     audit_rows = db.execute("SELECT * FROM audit_log ORDER BY id DESC LIMIT 15").fetchall()
@@ -176,120 +233,252 @@ def build_snapshot(db: sqlite3.Connection) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 def handover(db: sqlite3.Connection, pod_uid: str, target_rs_id: str) -> dict[str, Any]:
+    # 事务前读取只负责尽早给出 404，以及保留“请求已看到 Pod”的并发时序窗口；
+    # 一切写入依据都必须在 BEGIN IMMEDIATE 之后重新读取、逐笔核对。
     pod_row = db.execute(
         "SELECT p.*, p.rowid AS seq FROM pods p WHERE uid = ?", (pod_uid,)
     ).fetchone()
     if pod_row is None:
         raise UseCaseError("pod_not_found", f"找不到 Pod：{pod_uid}", 404)
-    pod = _pod_dict(pod_row)
 
     target_row = db.execute("SELECT * FROM replicasets WHERE id = ?", (target_rs_id,)).fetchone()
     if target_row is None:
         raise UseCaseError("rs_not_found", f"找不到目标 ReplicaSet：{target_rs_id}", 404)
-    target = _rs_dict(target_row)
 
-    source_row = db.execute(
-        "SELECT * FROM replicasets WHERE id = ?", (pod["rs_id"],)
-    ).fetchone()
-    source = _rs_dict(source_row)
+    pre_read_owner = pod_row["rs_id"]
 
-    # 规则：只能选就绪 Pod 交接（未就绪 Pod 不在 Service 名单上，也不符合演练前提）。
-    if not pod["ready"]:
-        message = (
-            f"Pod {pod['name']} 当前未就绪，不能作为“正在接流量的 Pod”交接。"
-            "UID、标签、归属和期望副本数均未改动。"
-        )
-        _audit(db, False, "handover_denied", f"拒绝交接 {pod['name']}：Pod 未就绪")
-        db.commit()
-        raise UseCaseError("pod_not_ready", message, 409)
+    # 并发实测卡点（生产为 no-op）：此处已读到 Pod，但尚未取写锁/写入。
+    _hook("handover:before_begin")
 
-    if source["id"] == target["id"]:
-        message = f"Pod {pod['name']} 已归属 {target['name']}，无需交接；状态未改动。"
-        _audit(db, False, "handover_denied", message)
-        db.commit()
-        raise UseCaseError("same_replicaset", message, 409)
+    denial: UseCaseError | None = None
+    result: dict[str, Any] | None = None
 
-    # 旧组期望数要 -1；已经是 0 时不能变成负数，按“办不到”保留原状。
-    if source["desired"] <= 0:
-        message = (
-            f"旧 ReplicaSet {source['name']} 的期望副本数已经是 0，"
-            "无法按“旧组减一、新组加一”联动变更，故保留原状并拒绝交接。"
-        )
-        _audit(db, False, "handover_denied", message)
-        db.commit()
-        raise UseCaseError("desired_floor", message, 409)
+    # 写锁串行化：同一时刻只有一笔交接（或计划执行）能进入提交段，
+    # 后到者拿锁后读到的一定是前一笔已提交的最新状态。
+    with immediate_transaction(db):
+        fresh_pod_row = db.execute(
+            "SELECT p.*, p.rowid AS seq FROM pods p WHERE uid = ?", (pod_uid,)
+        ).fetchone()
 
-    all_rs = [_rs_dict(r) for r in db.execute("SELECT * FROM replicasets").fetchall()]
-    all_services = [_svc_dict(r) for r in db.execute("SELECT * FROM services").fetchall()]
+        # 缩容计划抢先提交并删除了该 Pod：本笔交接必须整体不生效。
+        if fresh_pod_row is None:
+            message = (
+                f"Pod {pod_row['name']}（{pod_uid}）已被并发执行的缩容计划删除，"
+                "交接失去依据，已拒绝：两组期望副本数保持原值，"
+                "也不会写入成功交接记录。"
+            )
+            _audit(db, False, "handover_denied", f"拒绝交接 {pod_row['name']}：Pod 已被缩容删除")
+            denial = UseCaseError(
+                "pod_not_found",
+                message,
+                409,
+                {"concurrent": True, "reason": "deleted_by_scale_down", "pod_uid": pod_uid},
+            )
+        else:
+            pod = _pod_dict(fresh_pod_row)
 
-    # 纯计算：无解时抛 HandoverImpossible，此时尚未做任何写入。
-    try:
-        new_labels = plan_handover_labels(
-            pod["labels"],
-            source=source,
-            target=target,
-            replicasets=all_rs,
-            services=all_services,
-        )
-    except HandoverImpossible as exc:
-        _audit(
-            db, False, "handover_conflict",
-            f"标签冲突，交接 {pod['name']} -> {target['name']} 未执行：{exc.code} {exc.message}",
-        )
-        db.commit()
-        raise UseCaseError(exc.code, exc.message, 409) from exc
+            target_row = db.execute(
+                "SELECT * FROM replicasets WHERE id = ?", (target_rs_id,)
+            ).fetchone()
+            if target_row is None:
+                denial = UseCaseError(
+                    "rs_not_found", f"找不到目标 ReplicaSet：{target_rs_id}", 404
+                )
+            else:
+                target = _rs_dict(target_row)
+                source_row = db.execute(
+                    "SELECT * FROM replicasets WHERE id = ?", (pod["rs_id"],)
+                ).fetchone()
+                if source_row is None:
+                    raise UseCaseError(
+                        "rs_not_found", f"Pod 当前归属的 ReplicaSet 不存在：{pod['rs_id']}", 409
+                    )
+                source = _rs_dict(source_row)
 
-    old_desired_source = source["desired"]
-    old_desired_target = target["desired"]
+                # 规则：只能选就绪 Pod 交接（未就绪 Pod 不在 Service 名单上）。
+                if not pod["ready"]:
+                    message = (
+                        f"Pod {pod['name']} 当前未就绪，不能作为“正在接流量的 Pod”交接。"
+                        "UID、标签、归属和期望副本数均未改动。"
+                    )
+                    _audit(db, False, "handover_denied", f"拒绝交接 {pod['name']}：Pod 未就绪")
+                    denial = UseCaseError("pod_not_ready", message, 409)
 
-    # 归属 + 两边期望数 + 标签在同一个事务里联动提交。UID/ready 两列完全不更新。
-    with db:
-        db.execute(
-            "UPDATE pods SET labels_json = ?, rs_id = ? WHERE uid = ?",
-            (json.dumps(new_labels, ensure_ascii=False), target["id"], pod["uid"]),
-        )
-        cur = db.execute(
-            "UPDATE replicasets SET desired = desired - 1 WHERE id = ? AND desired > 0",
-            (source["id"],),
-        )
-        if cur.rowcount != 1:
-            raise UseCaseError("desired_floor", "旧组期望数扣减失败（可能已被并发修改），已回滚。", 409)
-        db.execute(
-            "UPDATE replicasets SET desired = desired + 1 WHERE id = ?",
-            (target["id"],),
-        )
-        change_text = (
-            f"{source['name']} desired {old_desired_source}→{old_desired_source - 1}；"
-            f"{target['name']} desired {old_desired_target}→{old_desired_target + 1}"
-        )
-        db.execute(
-            "INSERT INTO handovers(pod_uid, pod_name, from_rs_id, from_rs_name,"
-            " to_rs_id, to_rs_name, old_labels_json, new_labels_json, desired_change)"
-            " VALUES (?,?,?,?,?,?,?,?,?)",
-            (
-                pod["uid"], pod["name"], source["id"], source["name"],
-                target["id"], target["name"],
-                json.dumps(pod["labels"], ensure_ascii=False),
-                json.dumps(new_labels, ensure_ascii=False),
-                change_text,
-            ),
-        )
-        _audit(
-            db, True, "handover_ok",
-            f"交接成功：{pod['name']}（UID {pod['uid']}，就绪状态保留）"
-            f"{source['name']} → {target['name']}；{change_text}",
-        )
+                elif source["id"] == target["id"]:
+                    # 并发重复交接的落败者会在这里看到：同一 Pod 已被前一笔交给同一目标组。
+                    concurrent = pre_read_owner != target["id"]
+                    if concurrent:
+                        message = (
+                            f"Pod {pod['name']} 已在另一标签页/请求的并发交接中交给 "
+                            f"{target['name']}；同一 Pod 同时交给同一目标组只能有一笔生效，"
+                            "故本次重复交接被拒绝：期望数不再变动，也不新增成功交接记录。"
+                        )
+                        audit_msg = f"并发重复交接落败：{pod['name']} 已归属 {target['name']}"
+                    else:
+                        message = (
+                            f"Pod {pod['name']} 已归属 {target['name']}，无需交接；状态未改动。"
+                        )
+                        audit_msg = message
+                    _audit(db, False, "handover_denied", audit_msg)
+                    denial = UseCaseError(
+                        "same_replicaset",
+                        message,
+                        409,
+                        {"concurrent": concurrent, "reason": "duplicate_handover" if concurrent else "same_replicaset"},
+                    )
 
-    return {
-        "pod_uid": pod["uid"],
-        "pod_name": pod["name"],
-        "from_rs_id": source["id"],
-        "to_rs_id": target["id"],
-        "old_labels": pod["labels"],
-        "new_labels": new_labels,
-        "source_desired": old_desired_source - 1,
-        "target_desired": old_desired_target + 1,
-    }
+                # 旧组期望数要 -1；已经是 0 时不能变成负数，按“办不到”保留原状。
+                elif source["desired"] <= 0:
+                    message = (
+                        f"旧 ReplicaSet {source['name']} 的期望副本数已经是 0，"
+                        "无法按“旧组减一、新组加一”联动变更，故保留原状并拒绝交接。"
+                    )
+                    _audit(db, False, "handover_denied", message)
+                    denial = UseCaseError("desired_floor", message, 409)
+
+                else:
+                    all_rs = [
+                        _rs_dict(r)
+                        for r in db.execute("SELECT * FROM replicasets").fetchall()
+                    ]
+                    all_services = [
+                        _svc_dict(r)
+                        for r in db.execute("SELECT * FROM services").fetchall()
+                    ]
+
+                    # 纯计算：无解时抛 HandoverImpossible，此时本事务尚未做任何写入。
+                    try:
+                        new_labels = plan_handover_labels(
+                            pod["labels"],
+                            source=source,
+                            target=target,
+                            replicasets=all_rs,
+                            services=all_services,
+                        )
+                    except HandoverImpossible as exc:
+                        _audit(
+                            db, False, "handover_conflict",
+                            f"标签冲突，交接 {pod['name']} -> {target['name']} 未执行："
+                            f"{exc.code} {exc.message}",
+                        )
+                        denial = UseCaseError(exc.code, exc.message, 409)
+                    else:
+                        # 本笔事务内、持锁状态下读到的前后值才是“实际前后值”。
+                        src_before = int(source["desired"])
+                        tgt_before = int(target["desired"])
+
+                        # 条件更新再兜底一次归属：必须仍属于本事务读到的 source。
+                        cur = db.execute(
+                            "UPDATE pods SET labels_json = ?, rs_id = ?"
+                            " WHERE uid = ? AND rs_id = ?",
+                            (
+                                json.dumps(new_labels, ensure_ascii=False),
+                                target["id"],
+                                pod["uid"],
+                                source["id"],
+                            ),
+                        )
+                        if cur.rowcount != 1:
+                            # 理论上写锁串行后不会发生；发生则整体回滚，绝不报成功。
+                            raise UseCaseError(
+                                "handover_conflict",
+                                "Pod 归属在提交瞬间已被其它事务改变，本笔交接回滚，请刷新后重试。",
+                                409,
+                            )
+
+                        cur = db.execute(
+                            "UPDATE replicasets SET desired = desired - 1"
+                            " WHERE id = ? AND desired > 0",
+                            (source["id"],),
+                        )
+                        if cur.rowcount != 1:
+                            raise UseCaseError(
+                                "desired_floor",
+                                "旧组期望数扣减失败（可能已被并发修改），已回滚。",
+                                409,
+                            )
+                        db.execute(
+                            "UPDATE replicasets SET desired = desired + 1 WHERE id = ?",
+                            (target["id"],),
+                        )
+
+                        # 写后在同一事务内回读，确保记录的是实际提交值而非推算值。
+                        src_after = int(db.execute(
+                            "SELECT desired FROM replicasets WHERE id = ?", (source["id"],)
+                        ).fetchone()["desired"])
+                        tgt_after = int(db.execute(
+                            "SELECT desired FROM replicasets WHERE id = ?", (target["id"],)
+                        ).fetchone()["desired"])
+
+                        change_text = (
+                            f"{source['name']} desired {src_before}→{src_after}；"
+                            f"{target['name']} desired {tgt_before}→{tgt_after}"
+                        )
+                        db.execute(
+                            "INSERT INTO handovers(pod_uid, pod_name, from_rs_id, from_rs_name,"
+                            " to_rs_id, to_rs_name, old_labels_json, new_labels_json,"
+                            " desired_change, source_desired_before, source_desired_after,"
+                            " target_desired_before, target_desired_after)"
+                            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                            (
+                                pod["uid"], pod["name"], source["id"], source["name"],
+                                target["id"], target["name"],
+                                json.dumps(pod["labels"], ensure_ascii=False),
+                                json.dumps(new_labels, ensure_ascii=False),
+                                change_text,
+                                src_before, src_after, tgt_before, tgt_after,
+                            ),
+                        )
+                        _audit(
+                            db, True, "handover_ok",
+                            f"交接成功：{pod['name']}（UID {pod['uid']}，就绪状态保留）"
+                            f"{source['name']} → {target['name']}；实际期望数变化 {change_text}",
+                        )
+
+                        result = {
+                            "pod_uid": pod["uid"],
+                            "pod_name": pod["name"],
+                            "from_rs_id": source["id"],
+                            "to_rs_id": target["id"],
+                            "old_labels": pod["labels"],
+                            "new_labels": new_labels,
+                            # 兼容旧字段：两组的“后值”
+                            "source_desired": src_after,
+                            "target_desired": tgt_after,
+                            # 逐笔实际前后值
+                            "source_desired_before": src_before,
+                            "source_desired_after": src_after,
+                            "target_desired_before": tgt_before,
+                            "target_desired_after": tgt_after,
+                            "desired_before_after": {
+                                source["id"]: {
+                                    "name": source["name"],
+                                    "before": src_before,
+                                    "after": src_after,
+                                },
+                                target["id"]: {
+                                    "name": target["name"],
+                                    "before": tgt_before,
+                                    "after": tgt_after,
+                                },
+                            },
+                            "desired_before": {
+                                source["id"]: src_before, target["id"]: tgt_before,
+                            },
+                            "desired_after": {
+                                source["id"]: src_after, target["id"]: tgt_after,
+                            },
+                            "old_desired_source": src_before,
+                            "new_desired_source": src_after,
+                            "old_desired_target": tgt_before,
+                            "new_desired_target": tgt_after,
+                        }
+
+    # 正常退出 with 块时，拒绝审计（如有）随事务提交；denial 在提交后抛出。
+    if denial is not None:
+        raise denial
+    assert result is not None
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -393,78 +582,136 @@ def execute_plan(db: sqlite3.Connection, plan_id: int) -> dict[str, Any]:
             409,
         )
 
-    rs_row = db.execute("SELECT * FROM replicasets WHERE id = ?", (plan["rs_id"],)).fetchone()
-    rs = _rs_dict(rs_row)
-    owned = _owned_pods(db, rs["id"])
-    current_uids = sorted(p["uid"] for p in owned)
-    basis_uids = sorted(json.loads(plan["basis_uids_json"]))
+    def _current_basis() -> tuple[dict[str, Any], list[dict[str, Any]], list[str], bool, list[str]]:
+        rs_row = db.execute("SELECT * FROM replicasets WHERE id = ?", (plan["rs_id"],)).fetchone()
+        if rs_row is None:
+            raise UseCaseError("rs_not_found", f"找不到 ReplicaSet：{plan['rs_id']}", 404)
+        rs = _rs_dict(rs_row)
+        owned = _owned_pods(db, rs["id"])
+        current_uids = sorted(p["uid"] for p in owned)
+        basis_uids = sorted(json.loads(plan["basis_uids_json"]))
+        stale, changes = plan_is_stale(
+            basis_desired=plan["basis_desired"],
+            basis_uids=basis_uids,
+            current_desired=rs["desired"],
+            current_uids=current_uids,
+        )
+        return rs, owned, basis_uids, stale, changes
 
-    stale, changes = plan_is_stale(
-        basis_desired=plan["basis_desired"],
-        basis_uids=basis_uids,
-        current_desired=rs["desired"],
-        current_uids=current_uids,
-    )
+    # 事务前预检：多数“页面上已经能看出过期”的请求在这里直接退回。
+    rs, _owned, _basis_uids, stale, changes = _current_basis()
     if stale:
         reason = (
             f"计划 #{plan_id} 生成后，{rs['name']} 的期望副本数或 Pod 归属已改变，"
             f"情况已变化（{'；'.join(changes)}）。为避免误增删，旧计划已退回，"
             "请按当前期望数和现有归属重新生成计划后再执行。"
         )
-        with db:
+        with immediate_transaction(db):
             db.execute(
-                "UPDATE plans SET status = 'returned', stale_reason = ?, executed_at = datetime('now')"
-                " WHERE id = ?",
+                "UPDATE plans SET status = 'returned', stale_reason = ?,"
+                " executed_at = datetime('now') WHERE id = ? AND status = 'pending'",
                 (reason, plan_id),
             )
             _audit(db, False, "plan_returned", reason)
         raise UseCaseError("stale_plan", reason, 409, {"plan_id": plan_id, "changes": changes})
 
+    # 并发实测卡点：预检已通过、写事务尚未开始。此处若放行一个交接，
+    # 必须靠事务内复核把计划退回，而不能继续按旧名单删除。
+    _hook("plan:after_precheck")
+
     delete_uids = json.loads(plan["delete_uids_json"])
     add_count = int(plan["add_count"])
-    created_names: list[str] = []
 
-    with db:
-        # 扩容：按 RS 选择器生成最小标签集的新 Pod（演练中直接置为就绪）。
-        for _ in range(add_count):
-            uid = str(uuid.uuid4())
-            name = f"{rs['name']}-{uuid.uuid4().hex[:5]}"
+    stale_error: UseCaseError | None = None
+    done_result: dict[str, Any] | None = None
+
+    with immediate_transaction(db):
+        # 拿写锁后重新读取计划状态与全部依据，按实际生效顺序做最终核对。
+        fresh_plan_row = db.execute("SELECT * FROM plans WHERE id = ?", (plan_id,)).fetchone()
+        if fresh_plan_row is None:
+            raise UseCaseError("plan_not_found", f"找不到计划 #{plan_id}", 404)
+        fresh_status = fresh_plan_row["status"]
+        if fresh_status == "executed":
+            raise UseCaseError(
+                "plan_already_executed", f"计划 #{plan_id} 已经执行过，不能重复执行。", 409
+            )
+        if fresh_status == "returned":
+            raise UseCaseError(
+                "plan_returned",
+                f"计划 #{plan_id} 已被退回，请按当前期望副本数和现有归属重新生成计划。",
+                409,
+            )
+
+        rs, _owned, _basis_uids, stale, changes = _current_basis()
+        if stale:
+            # 典型交错：预检后交接先提交。失配计划在同一事务内置 returned，
+            # 不增删任何 Pod，提交后抛出 stale_plan。
+            reason = (
+                f"计划 #{plan_id} 生成后，{rs['name']} 的期望副本数或 Pod 归属已改变，"
+                f"情况已变化（{'；'.join(changes)}）。为避免误增删，旧计划已退回，"
+                "请按当前期望数和现有归属重新生成计划后再执行。"
+            )
             db.execute(
-                "INSERT INTO pods(uid, name, labels_json, ready, rs_id)"
-                " VALUES (?,?,?,1,?)",
-                (uid, name, json.dumps(rs["selector"], ensure_ascii=False), rs["id"]),
+                "UPDATE plans SET status = 'returned', stale_reason = ?,"
+                " executed_at = datetime('now') WHERE id = ?",
+                (reason, plan_id),
             )
-            created_names.append(name)
+            _audit(db, False, "plan_returned", reason)
+            stale_error = UseCaseError(
+                "stale_plan", reason, 409, {"plan_id": plan_id, "changes": changes}
+            )
+        else:
+            created_names: list[str] = []
 
-        for uid in delete_uids:
-            cur = db.execute(
-                "DELETE FROM pods WHERE uid = ? AND rs_id = ?", (uid, rs["id"])
-            )
-            if cur.rowcount != 1:
-                raise UseCaseError(
-                    "plan_delete_failed",
-                    f"计划中的 Pod {uid} 已不属于 {rs['name']}，执行中止，事务回滚。",
-                    409,
+            # 扩容：按 RS 选择器生成最小标签集的新 Pod（演练中直接置为就绪）。
+            for _ in range(add_count):
+                uid = str(uuid.uuid4())
+                name = f"{rs['name']}-{uuid.uuid4().hex[:5]}"
+                db.execute(
+                    "INSERT INTO pods(uid, name, labels_json, ready, rs_id)"
+                    " VALUES (?,?,?,1,?)",
+                    (uid, name, json.dumps(rs["selector"], ensure_ascii=False), rs["id"]),
                 )
+                created_names.append(name)
 
-        result_parts = []
-        if created_names:
-            result_parts.append("已新增 " + "、".join(created_names))
-        if delete_uids:
-            result_parts.append(f"已删除 {len(delete_uids)} 个 Pod")
-        if not result_parts:
-            result_parts.append("计划为空操作，副本数已一致")
-        result = "；".join(result_parts)
+            for uid in delete_uids:
+                cur = db.execute(
+                    "DELETE FROM pods WHERE uid = ? AND rs_id = ?", (uid, rs["id"])
+                )
+                if cur.rowcount != 1:
+                    # 依据复核通过且写锁串行，正常不会走到；走到就整体回滚。
+                    raise UseCaseError(
+                        "plan_delete_failed",
+                        f"计划中的 Pod {uid} 已不属于 {rs['name']}，执行中止，事务回滚。",
+                        409,
+                    )
 
-        db.execute(
-            "UPDATE plans SET status = 'executed', result = ?, executed_at = datetime('now')"
-            " WHERE id = ?",
-            (result, plan_id),
-        )
-        _audit(db, True, "plan_executed", f"计划 #{plan_id}（{rs['name']}）执行完成：{result}")
+            result_parts = []
+            if created_names:
+                result_parts.append("已新增 " + "、".join(created_names))
+            if delete_uids:
+                result_parts.append(f"已删除 {len(delete_uids)} 个 Pod")
+            if not result_parts:
+                result_parts.append("计划为空操作，副本数已一致")
+            result = "；".join(result_parts)
 
-    return {"plan_id": plan_id, "result": result,
-            "created_names": created_names, "deleted_uids": delete_uids}
+            db.execute(
+                "UPDATE plans SET status = 'executed', result = ?, executed_at = datetime('now')"
+                " WHERE id = ?",
+                (result, plan_id),
+            )
+            _audit(db, True, "plan_executed", f"计划 #{plan_id}（{rs['name']}）执行完成：{result}")
+            done_result = {
+                "plan_id": plan_id,
+                "result": result,
+                "created_names": created_names,
+                "deleted_uids": delete_uids,
+            }
+
+    if stale_error is not None:
+        raise stale_error
+    assert done_result is not None
+    return done_result
 
 
 def discard_plan(db: sqlite3.Connection, plan_id: int) -> None:

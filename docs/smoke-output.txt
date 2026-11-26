@@ -38,7 +38,7 @@ plan #1: 新增 1 个 Pod（标签 app=shop, release=blue，就绪）
 4. 成功交接 UID1 → web-v2（保留 UID/Ready/Service 流量）
 ========================================================================
 [PASS] 交接成功 200
-{'from_rs_id': 'rs-v1', 'new_labels': {'app': 'shop', 'release': 'green', 'zone': 'a'}, 'old_labels': {'app': 'shop', 'release': 'blue', 'zone': 'a'}, 'pod_name': 'web-v1-a1', 'pod_uid': '10000000-0000-4000-8000-000000000001', 'source_desired': 3, 'target_desired': 3, 'to_rs_id': 'rs-v2'}
+{'desired_after': {'rs-v1': 3, 'rs-v2': 3}, 'desired_before': {'rs-v1': 4, 'rs-v2': 2}, 'desired_before_after': {'rs-v1': {'after': 3, 'before': 4, 'name': 'web-v1'}, 'rs-v2': {'after': 3, 'before': 2, 'name': 'web-v2'}}, 'from_rs_id': 'rs-v1', 'new_desired_source': 3, 'new_desired_target': 3, 'new_labels': {'app': 'shop', 'release': 'green', 'zone': 'a'}, 'old_desired_source': 4, 'old_desired_target': 2, 'old_labels': {'app': 'shop', 'release': 'blue', 'zone': 'a'}, 'pod_name': 'web-v1-a1', 'pod_uid': '10000000-0000-4000-8000-000000000001', 'source_desired': 3, 'source_desired_after': 3, 'source_desired_before': 4, 'target_desired': 3, 'target_desired_after': 3, 'target_desired_before': 2, 'to_rs_id': 'rs-v2'}
 [PASS] UID 不变且仍 Ready
 [PASS] 归属变为 web-v2 且只命中 web-v2
 [PASS] 仍在 Service 就绪名单且总数仍为 4
@@ -59,7 +59,7 @@ HTTP 409 code=stale_plan
 ========================================================================
 [PASS] 重算计划 add_count 仍为 1（desired=3 / owned=2）
 [PASS] 执行新计划成功
-已新增 web-v1-b1e20
+已新增 web-v1-ee428
 [PASS] 执行后 Pod 总数 6 且 web-v1 归属回到 3
 
 ========================================================================
